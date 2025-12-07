@@ -1,10 +1,15 @@
 import Link from "next/link"
 import { ArrowRight, ChefHat, Clock, Sparkles, Users } from "lucide-react"
 import { RecipeGrid } from "./components/recipe-grid"
-import { mockRecipes } from "@/lib/mock-data"
+import type { RecipeSummary } from "@/types/recipe"
 
-export default function Home() {
-  const popularRecipes = mockRecipes.slice(0, 6)
+const POPULAR_RECIPES_LIMIT = 6
+const FALLBACK_IMAGE = "/placeholder.svg?height=300&width=400&query=delicious food dish"
+const POPULAR_RECIPES_ERROR = "Unable to load popular recipes right now. Please try again later."
+const VALID_DIFFICULTIES = new Set(["easy", "medium", "hard"])
+
+export default async function Home() {
+  const { recipes: popularRecipes, error: popularRecipesError } = await fetchPopularRecipes()
 
   return (
     <div className="flex flex-col">
@@ -98,31 +103,37 @@ export default function Home() {
       </section>
 
       {/* Popular Recipes Section */}
-      <section className="mx-auto max-w-7xl px-4 py-16 sm:px-6 lg:px-8">
-        <div className="mb-8 flex items-end justify-between">
-          <div>
-            <h2 className="text-2xl font-bold sm:text-3xl">Popular Recipes</h2>
-            <p className="mt-2 text-muted-foreground">Trending dishes loved by our community</p>
+      <section className="w-full px-4 py-16 sm:px-6 lg:px-12 xl:px-20">
+        <div className="mx-auto max-w-screen-2xl">
+          <div className="mb-8 flex items-end justify-between">
+            <div>
+              <h2 className="text-2xl font-bold sm:text-3xl">Popular Recipes</h2>
+              <p className="mt-2 text-muted-foreground">Trending dishes loved by our community</p>
+            </div>
+            <Link
+              href="/recipes"
+              className="hidden items-center gap-1 text-sm font-medium text-primary hover:underline sm:flex"
+            >
+              View all recipes
+              <ArrowRight className="h-4 w-4" />
+            </Link>
           </div>
-          <Link
-            href="/recipes"
-            className="hidden items-center gap-1 text-sm font-medium text-primary hover:underline sm:flex"
-          >
-            View all recipes
-            <ArrowRight className="h-4 w-4" />
-          </Link>
-        </div>
 
-        <RecipeGrid recipes={popularRecipes} />
+          <RecipeGrid
+            recipes={popularRecipes}
+            errorMessage={popularRecipesError}
+            emptyMessage="No popular recipes available right now. Check back soon!"
+          />
 
-        <div className="mt-8 text-center sm:hidden">
-          <Link
-            href="/recipes"
-            className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline"
-          >
-            View all recipes
-            <ArrowRight className="h-4 w-4" />
-          </Link>
+          <div className="mt-8 text-center sm:hidden">
+            <Link
+              href="/recipes"
+              className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline"
+            >
+              View all recipes
+              <ArrowRight className="h-4 w-4" />
+            </Link>
+          </div>
         </div>
       </section>
 
@@ -147,4 +158,144 @@ export default function Home() {
       </section>
     </div>
   )
+}
+
+async function fetchPopularRecipes(): Promise<{ recipes: RecipeSummary[]; error: string | null }> {
+  const baseUrl = getBaseUrl()
+  const url = `${baseUrl}/api/fetch-recipes?limit=${POPULAR_RECIPES_LIMIT}&page=1`
+
+  try {
+    const response = await fetch(url, {
+      next: { revalidate: 60 },
+    })
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch popular recipes: ${response.statusText}`)
+    }
+
+    const payload = (await response.json()) as { data?: unknown }
+
+    return {
+      recipes: normalizeRecipes(payload.data),
+      error: null,
+    }
+  } catch (error) {
+    console.error("Popular recipes fetch error", error)
+    return {
+      recipes: [],
+      error: POPULAR_RECIPES_ERROR,
+    }
+  }
+}
+
+const normalizeRecipes = (payload: unknown): RecipeSummary[] => {
+  if (!Array.isArray(payload)) {
+    return []
+  }
+
+  return payload.map((recipe, index) => normalizeRecipe(recipe as Record<string, unknown>, index))
+}
+
+const normalizeRecipe = (recipe: Record<string, unknown>, index: number): RecipeSummary => {
+  const fallbackId =
+    getString(recipe["_id"]) ?? getString(recipe["id"]) ?? getString(recipe["slug"]) ?? `recipe-${index}`
+  const fallbackTimestamp = new Date().toISOString()
+  const createdAt = ensureDateString(recipe["createdAt"], fallbackTimestamp)
+  const updatedAt = ensureDateString(recipe["updatedAt"], createdAt)
+
+  const categories = Array.isArray(recipe["categories"])
+    ? (recipe["categories"] as unknown[]).filter(
+        (category): category is string => typeof category === "string" && category.length > 0,
+      )
+    : []
+
+  const ingredients = Array.isArray(recipe["ingredients"])
+    ? (recipe["ingredients"] as unknown[]).map((ingredient, ingredientIndex) => {
+        const entry = ingredient as Record<string, unknown>
+        return {
+          id: getString(entry["id"]) ?? `${fallbackId}-ingredient-${ingredientIndex}`,
+          name: getString(entry["name"]) ?? "",
+          amount: getNumber(entry["amount"]),
+          unit: getString(entry["unit"]) ?? "",
+        }
+      })
+    : []
+
+  const instructions = Array.isArray(recipe["instructions"])
+    ? (recipe["instructions"] as unknown[]).filter(
+        (step): step is string => typeof step === "string" && step.trim().length > 0,
+      )
+    : []
+
+  const nutritionSource = (recipe["nutrition"] as Record<string, unknown>) || {}
+  const prepTime = getNumber(recipe["prepTime"])
+  const cookTime = getNumber(recipe["cookTime"])
+  const totalTime = getNumber(recipe["totalTime"], prepTime + cookTime)
+
+  const rawDifficulty = getString(recipe["difficulty"])?.toLowerCase()
+  const difficulty = rawDifficulty && VALID_DIFFICULTIES.has(rawDifficulty) ? rawDifficulty : "medium"
+
+  return {
+    id: getString(recipe["id"]) ?? fallbackId,
+    slug: getString(recipe["slug"]) ?? fallbackId,
+    title: getString(recipe["title"]) ?? "Untitled recipe",
+    description: getString(recipe["description"]) ?? "",
+    imageUrl: getString(recipe["imageUrl"]) || FALLBACK_IMAGE,
+    categories,
+    difficulty: difficulty as RecipeSummary["difficulty"],
+    prepTime,
+    cookTime,
+    totalTime,
+    servings: Math.max(getNumber(recipe["servings"], 1), 1),
+    nutrition: {
+      calories: getNumber(nutritionSource["calories"]),
+      protein: getNumber(nutritionSource["protein"]),
+      carbs: getNumber(nutritionSource["carbs"]),
+      fat: getNumber(nutritionSource["fat"]),
+    },
+    ingredients,
+    instructions,
+    likes: getNumber(recipe["likes"]),
+    isLiked: Boolean(recipe["isLiked"]),
+    isSaved: Boolean(recipe["isSaved"]),
+    createdAt,
+    updatedAt,
+  }
+}
+
+const getString = (value: unknown): string | undefined => {
+  if (typeof value === "string") return value
+  if (typeof value === "number" && Number.isFinite(value)) return value.toString()
+  if (typeof value === "object" && value !== null && "toString" in value) {
+    const stringValue = (value as { toString: () => string }).toString()
+    if (typeof stringValue === "string" && stringValue !== "[object Object]") {
+      return stringValue
+    }
+  }
+  return undefined
+}
+
+const getNumber = (value: unknown, defaultValue = 0): number => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : defaultValue
+}
+
+const ensureDateString = (value: unknown, fallback: string): string => {
+  if (value instanceof Date) {
+    return value.toISOString()
+  }
+  if (typeof value === "string" && value.length > 0) {
+    return value
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return new Date(value).toISOString()
+  }
+  return fallback
+}
+
+const getBaseUrl = () => {
+  if (process.env.NEXT_PUBLIC_APP_URL) return process.env.NEXT_PUBLIC_APP_URL
+  if (process.env.NEXTAUTH_URL) return process.env.NEXTAUTH_URL
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`
+  return "http://localhost:3000"
 }
